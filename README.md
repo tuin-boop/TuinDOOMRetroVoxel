@@ -8,6 +8,8 @@ This is an unofficial community project directed and tested by **Tuin**. It
 keeps DOOM Retro's look and feel while allowing decorations, pickups, monsters,
 corpses and other mapped sprites to remain voxels from every viewing angle.
 
+![A voxelized demon in Hell Keep](docs/images/hell-keep.png)
+
 > [!IMPORTANT]
 > This is **not general GZDoom PK3 support**. The loader recognizes
 > `VOXELDEF`, `VOXELDEF.txt`, and `.kvx` files inside `voxels/`. Features such
