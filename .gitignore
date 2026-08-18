@@ -51,7 +51,7 @@ CodeAnalysisResultManifest.txt
 doomretro.cfg
 doomretro.exp
 doomretro.lib
-doomretro.wad
+/doomretro.wad
 doomretro*.zip
 
 # Build results
