@@ -1,0 +1,1354 @@
+/*
+==============================================================================
+
+                                 DOOM Retro
+           The classic, refined DOOM source port. For Windows PC.
+
+==============================================================================
+
+    Copyright © 1993-2026 by id Software LLC, a ZeniMax Media company.
+    Copyright © 2013-2026 by Brad Harding <mailto:brad@doomretro.com>.
+
+    This file is a part of DOOM Retro.
+
+    DOOM Retro is free software: you can redistribute it and/or modify it
+    under the terms of the GNU General Public License as published by the
+    Free Software Foundation, either version 3 of the license, or (at your
+    option) any later version.
+
+    DOOM Retro is distributed in the hope that it will be useful, but
+    WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
+    General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with DOOM Retro. If not, see <https://www.gnu.org/licenses/>.
+
+    DOOM is a registered trademark of id Software LLC, a ZeniMax Media
+    company, in the US and/or other countries, and is used without
+    permission. All other trademarks are the property of their respective
+    holders. DOOM Retro is in no way affiliated with nor endorsed by
+    id Software.
+
+==============================================================================
+*/
+
+#if defined(_WIN32)
+#pragma warning( disable : 4091 )
+
+#include <Windows.h>
+#include <sys/stat.h>
+
+#if defined(_MSC_VER)
+#include <direct.h>
+#endif
+
+#else
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <pwd.h>
+#endif
+
+#include <ctype.h>
+#include <limits.h>
+#include <math.h>
+#include <stdarg.h>
+#include <string.h>
+
+#if defined(__APPLE__)
+#import <Cocoa/Cocoa.h>
+
+#include <dirent.h>
+#include <libgen.h>
+#include <mach-o/dyld.h>
+#include <errno.h>
+#elif defined(__OpenBSD__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__DragonFly__)
+#include <sys/sysctl.h>
+#include <dirent.h>
+#include <errno.h>
+#include <libgen.h>
+#include <unistd.h>
+#elif defined(__linux__) || defined(__HAIKU__) || defined(__sun)
+#include <dirent.h>
+#include <errno.h>
+#include <libgen.h>
+#include <unistd.h>
+
+#if defined(__HAIKU__)
+#include <FindDirectory.h>
+#endif
+#endif
+
+#include "c_console.h"
+#include "i_system.h"
+#include "m_config.h"
+#include "m_misc.h"
+#include "w_file.h"
+
+const char *daynames[7] =
+{
+    "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"
+};
+
+const char *monthnames[12] =
+{
+    "January", "February", "March",     "April",   "May",      "June",
+    "July",    "August",   "September", "October", "November", "December"
+};
+
+#if !defined(S_ISDIR)
+#define S_ISDIR(mode)   (((mode) & S_IFDIR) == S_IFDIR)
+#endif
+
+#if defined(__linux__) || defined(__FreeBSD__) || defined(__HAIKU__) || defined(__APPLE__)
+bool M_system(const char *command)
+{
+    const int   result = system(command);
+
+    return (result != -1 && WIFEXITED(result) && !WEXITSTATUS(result));
+}
+#endif
+
+// Create a directory
+void M_MakeDirectory(const char *path)
+{
+#if defined(_WIN32)
+    mkdir(path);
+#else
+    mkdir(path, 0755);
+#endif
+}
+
+// Check if a file exists
+bool M_FileExists(const char *filename)
+{
+    struct stat status;
+
+    return (!stat(filename, &status) && !S_ISDIR(status.st_mode));
+}
+
+#if !defined(_WIN32) && !defined(__APPLE__)
+static bool file_exists_get_path(const char *basedir, const char *filename, char **retpath)
+{
+    *retpath = M_StringJoin(basedir, DIR_SEPARATOR_S, filename, NULL);
+
+    if (M_FileExists(*retpath))
+        return true;
+
+    free(*retpath);
+    *retpath = NULL;
+    return false;
+}
+
+// Check if a file exists by probing for common case variation of its filename.
+// Returns a newly allocated string that the caller is responsible for freeing.
+char *M_FileCaseExists(const char *path)
+{
+    const char  *basedir = ".";
+    char        *allocatedbasedir = NULL;
+    char        *filename;
+    char        *retpath = NULL;
+    char        *tmpfilename = NULL;
+    char        *pos;
+
+    // actual path
+    if (M_FileExists(path))
+        return M_StringDuplicate(path);
+
+    if ((pos = strrchr(path, DIR_SEPARATOR)))
+    {
+        allocatedbasedir = M_SubString(path, 0, pos - path);
+        basedir = allocatedbasedir;
+        filename = M_StringDuplicate(pos + 1);
+    }
+    else
+        filename = M_StringDuplicate(path);
+
+    // lowercase filename, e.g. doom2.wad
+    if (file_exists_get_path(basedir, lowercase(filename), &retpath))
+        goto cleanup;
+
+    // uppercase filename, e.g. DOOM2.WAD
+    tmpfilename = uppercase(filename);
+
+    if (file_exists_get_path(basedir, tmpfilename, &retpath))
+        goto cleanup;
+
+    // uppercase basename with lowercase extension, e.g. DOOM2.wad
+    if ((pos = strrchr(tmpfilename, '.')) && tmpfilename[strlen(tmpfilename) - 1] != '.')
+    {
+        lowercase(pos + 1);
+
+        if (file_exists_get_path(basedir, tmpfilename, &retpath))
+            goto cleanup;
+    }
+
+    // lowercase filename with uppercase first letter, e.g. Doom2.wad
+    if (strlen(tmpfilename) > 1)
+    {
+        lowercase(tmpfilename + 1);
+
+        if (file_exists_get_path(basedir, tmpfilename, &retpath))
+            goto cleanup;
+    }
+
+cleanup:
+    free(filename);
+
+    if (tmpfilename)
+        free(tmpfilename);
+
+    free(allocatedbasedir);
+
+    return retpath;
+}
+#endif
+
+// Check if a folder exists
+bool M_FolderExists(const char *folder)
+{
+    struct stat status;
+
+    return (!stat(folder, &status) && S_ISDIR(status.st_mode));
+}
+
+// Safe string copy function that works like OpenBSD's strlcpy().
+void M_StringCopy(char *dest, const char *src, const size_t dest_size)
+{
+    if (dest_size >= 1)
+    {
+        dest[dest_size - 1] = '\0';
+
+        if (dest_size > 1)
+            strncpy(dest, src, dest_size - 1);
+    }
+}
+
+void M_CopyLumpName(char *dest, const char *src)
+{
+    memset(dest, 0, 8);
+
+    for (int i = 0; i < 8; i++)
+    {
+        dest[i] = src[i];
+
+        if (src[i] == '\0')
+            break;
+    }
+}
+
+char *M_ExtractFolder(const char *path)
+{
+    char    *pos;
+    char    *folder = M_StringDuplicate(path);
+
+    if ((pos = strrchr(folder, DIR_SEPARATOR)))
+        *pos = '\0';
+
+    return folder;
+}
+
+char *M_GetAppDataFolder(void)
+{
+    char    *executablefolder = M_GetExecutableFolder();
+
+#if defined(_WIN32)
+    return executablefolder;
+#else
+    // On Linux and macOS, if ../share/doomretro doesn't exist then we're dealing with
+    // a portable installation, and we write doomretro.cfg to the executable directory.
+    char    *resourcefolder = M_StringJoin(executablefolder,
+                DIR_SEPARATOR_S ".." DIR_SEPARATOR_S "share" DIR_SEPARATOR_S DOOMRETRO, NULL);
+    DIR     *resourcedir = opendir(resourcefolder);
+
+    free(resourcefolder);
+
+    if (resourcedir)
+    {
+#if defined(__APPLE__)
+        // On macOS, store generated application files in ~/Library/Application Support/DOOM Retro.
+        NSFileManager   *manager = [NSFileManager defaultManager];
+        NSURL           *baseAppSupportURL = [manager URLsForDirectory : NSApplicationSupportDirectory
+                            inDomains : NSUserDomainMask].firstObject;
+        NSURL           *appSupportURL = [baseAppSupportURL URLByAppendingPathComponent : @DOOMRETRO_NAME];
+
+        closedir(resourcedir);
+
+        return M_StringDuplicate((char *)appSupportURL.fileSystemRepresentation);
+#else
+        // On Linux, store generated application files in /home/<username>/.config/doomretro
+        char    *buffer = getenv("HOME");
+
+        if (!buffer)
+        {
+            struct passwd   *pwd = getpwuid(getuid());
+
+            if (!pwd)
+            {
+                closedir(resourcedir);
+                return executablefolder;
+            }
+
+            buffer = pwd->pw_dir;
+        }
+
+        closedir(resourcedir);
+        free(executablefolder);
+
+#if defined(__HAIKU__)
+        return M_StringJoin(buffer, DIR_SEPARATOR_S "config" DIR_SEPARATOR_S "settings" DIR_SEPARATOR_S DOOMRETRO, NULL);
+#else
+        return M_StringJoin(buffer, DIR_SEPARATOR_S ".config" DIR_SEPARATOR_S DOOMRETRO, NULL);
+#endif
+#endif
+    }
+    else
+        return executablefolder;
+#endif
+}
+
+char *M_GetResourceFolder(void)
+{
+    char    *executablefolder = M_GetExecutableFolder();
+
+#if !defined(_WIN32)
+    // On Linux and macOS, first assume that the executable is in ../bin and
+    // try to load resources from ../share/doomretro.
+    char    *resourcefolder = M_StringJoin(executablefolder,
+                DIR_SEPARATOR_S ".." DIR_SEPARATOR_S "share" DIR_SEPARATOR_S DOOMRETRO, NULL);
+    DIR     *resourcedir = opendir(resourcefolder);
+
+    if (resourcedir)
+    {
+        closedir(resourcedir);
+        free(executablefolder);
+
+        return resourcefolder;
+    }
+
+#if defined(__APPLE__)
+    // On macOS, load resources from the Contents/Resources folder within the application bundle
+    // if ../share/doomretro is not available.
+    NSURL   *resourceURL = [NSBundle mainBundle].resourceURL;
+
+    free(resourcefolder);
+    free(executablefolder);
+
+    return M_StringDuplicate((char *)resourceURL.fileSystemRepresentation);
+#else
+    free(resourcefolder);
+    // And on Linux, fall back to the same folder as the executable.
+    return executablefolder;
+#endif
+
+#else
+    // On Windows, load resources from the same folder as the executable.
+    return executablefolder;
+#endif
+}
+
+char *M_GetExecutableFolder(void)
+{
+#if defined(_WIN32)
+    char    *folder = malloc(MAX_PATH);
+
+    if (folder)
+    {
+        char    *pos;
+
+        GetModuleFileName(NULL, folder, MAX_PATH);
+
+        if ((pos = strrchr(folder, DIR_SEPARATOR)))
+            *pos = '\0';
+    }
+
+    return folder;
+#elif defined(__linux__) || defined(__NetBSD__) || defined(__sun)
+    char    exe[MAX_PATH];
+
+#if defined(__linux__)
+    ssize_t len = readlink("/proc/self/exe", exe, MAX_PATH - 1);
+#elif defined(__NetBSD__)
+    ssize_t len = readlink("/proc/curproc/exe", exe, MAX_PATH - 1);
+#elif defined(__sun)
+    ssize_t len = readlink("/proc/self/path/a.out", exe, MAX_PATH - 1);
+#endif
+
+    if (len == -1)
+    {
+        strcpy(exe, ".");
+        return M_StringDuplicate(exe);
+    }
+    else
+    {
+        exe[len] = '\0';
+        return M_StringDuplicate(dirname(exe));
+    }
+#elif defined(__FreeBSD__) || defined(__DragonFly__)
+    char    exe[MAX_PATH];
+    size_t  len = MAX_PATH;
+    int     mib[] = { CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME, -1 };
+
+    if (!sysctl(mib, 4, exe, &len, NULL, 0))
+    {
+        exe[len] = '\0';
+        return M_StringDuplicate(dirname(exe));
+    }
+    else
+    {
+        strcpy(exe, ".");
+        return M_StringDuplicate(exe);
+    }
+#elif defined(__APPLE__)
+    char        exe[MAX_PATH];
+    uint32_t    len = MAX_PATH;
+
+    if (_NSGetExecutablePath(exe, &len))
+    {
+        strcpy(exe, ".");
+        return M_StringDuplicate(exe);
+    }
+
+    return M_StringDuplicate(dirname(exe));
+#elif defined(__HAIKU__)
+    char    exe[MAX_PATH];
+
+    exe[0] = '\0';
+
+    if (find_path(B_APP_IMAGE_SYMBOL, B_FIND_PATH_IMAGE_PATH, NULL, exe, MAX_PATH) == B_OK)
+        return M_StringDuplicate(dirname(exe));
+
+    strcpy(exe, ".");
+    return M_StringDuplicate(exe);
+#else
+    char    *folder = malloc(2);
+
+    strcpy(folder, ".");
+    return folder;
+#endif
+}
+
+char *M_TempFile(char *s)
+{
+    char    *tempdir;
+
+#if defined(_WIN32)
+    if (!(tempdir = getenv("TEMP")))
+        tempdir = ".";
+#else
+    tempdir = DIR_SEPARATOR_S "tmp";
+#endif
+
+    return M_StringJoin(tempdir, DIR_SEPARATOR_S, s, NULL);
+}
+
+// Return a newly-malloced string with all the strings given as arguments
+// concatenated together.
+char *M_StringJoin(const char *s, ...)
+{
+    char        *result;
+    const char  *v;
+    va_list     args;
+    size_t      result_len = strlen(s) + 1;
+
+    va_start(args, s);
+
+    while (true)
+    {
+        if (!(v = va_arg(args, const char *)))
+            break;
+
+        result_len += strlen(v);
+    }
+
+    va_end(args);
+
+    result = I_Malloc(result_len);
+
+    M_StringCopy(result, s, result_len);
+
+    va_start(args, s);
+
+    while (true)
+    {
+        if (!(v = va_arg(args, const char *)))
+            break;
+
+        M_StringCopy(result + strlen(result), v, result_len - strlen(result));
+    }
+
+    va_end(args);
+    return result;
+}
+
+bool M_StrToInt(const char *str, int *result)
+{
+    char    *end;
+    long    value;
+
+    value = strtol(str, &end, 0);
+
+    if (end == str)
+        return false;
+
+    while (*end && isspace((unsigned char)*end))
+        end++;
+
+    if (*end)
+        return false;
+
+    *result = (int)value;
+    return true;
+}
+
+bool M_StringToDigest(const char *string, byte *digest, int size)
+{
+    if ((int)strlen(string) < 2 * size)
+        return false;
+
+    for (int i = 0; i < size; i++)
+    {
+        unsigned int    value;
+
+        if (sscanf(string + i * 2, "%02x", &value) != 1)
+            return false;
+
+        digest[i] = (byte)value;
+    }
+
+    return true;
+}
+
+// Case-insensitive version of strstr()
+const char *M_StrCaseStr(const char *haystack, const char *needle)
+{
+    const int   haystack_len = (int)strlen(haystack);
+    const int   needle_len = (int)strlen(needle);
+    int         len;
+
+    if (haystack_len < needle_len)
+        return NULL;
+
+    len = haystack_len - needle_len;
+
+    for (int i = 0; i <= len; i++)
+        if (!strncasecmp(haystack + i, needle, needle_len))
+            return (haystack + i);
+
+    return NULL;
+}
+
+#if !defined(stristr)
+static char *stristr(char *ch1, const char *ch2)
+{
+    return (char *)M_StrCaseStr(ch1, ch2);
+}
+#endif
+
+static char     *stringreplacebuffer;
+static size_t   stringreplacebuffersize;
+
+static char *M_StringReplaceAt(const char *haystack, const char *needle, const char *replacement,
+    const char *match)
+{
+    const size_t    needle_len = strlen(needle);
+    const size_t    replacement_len = strlen(replacement);
+    const size_t    prefix_len = (size_t)(match - haystack);
+    const size_t    result_len = prefix_len + replacement_len + strlen(match + needle_len) + 1;
+
+    if (stringreplacebuffersize < result_len)
+    {
+        stringreplacebuffer = I_Realloc(stringreplacebuffer, result_len);
+        stringreplacebuffersize = result_len;
+    }
+
+    memcpy(stringreplacebuffer, haystack, prefix_len);
+    memcpy(stringreplacebuffer + prefix_len, replacement, replacement_len);
+    M_StringCopy(stringreplacebuffer + prefix_len + replacement_len, match + needle_len,
+        result_len - (prefix_len + replacement_len));
+
+    return stringreplacebuffer;
+}
+
+// String replace function.
+char *M_StringReplaceFirst(char *haystack, const char *needle, const char *replacement)
+{
+    char    *p;
+
+    if (!*needle || !(p = stristr(haystack, needle)))
+        return haystack;
+
+    return M_StringReplaceAt(haystack, needle, replacement, p);
+}
+
+#if !defined(strrstr)
+static char *strrstr(const char *haystack, const char *needle)
+{
+    char    *r = NULL;
+
+    if (!needle[0])
+        return (char *)haystack + strlen(haystack);
+
+    while (true)
+    {
+        char    *p = strstr(haystack, needle);
+
+        if (!p)
+            return r;
+
+        r = p;
+        haystack = p + 1;
+    }
+}
+#endif
+
+char *M_StringReplaceLast(char *haystack, const char *needle, const char *replacement)
+{
+    char    *p;
+
+    if (!*needle || !(p = strrstr(haystack, needle)))
+        return haystack;
+
+    return M_StringReplaceAt(haystack, needle, replacement, p);
+}
+
+void M_StringReplaceAll(char *haystack, const char *needle, const char *replacement, bool usecase)
+{
+    char            *buffer;
+    char            *insert_point;
+    char            *temp = haystack;
+    const size_t    haystack_len = strlen(haystack);
+    const size_t    needle_len = strlen(needle);
+    const size_t    repl_len = strlen(replacement);
+    size_t          count = 0;
+
+    if (!needle_len)
+        return;
+
+    while (true)
+    {
+        char    *p = (usecase ? strstr(temp, needle) : stristr(temp, needle));
+
+        if (!p)
+            break;
+
+        count++;
+        temp = p + needle_len;
+    }
+
+    if (!count)
+        return;
+
+    buffer = I_Malloc(haystack_len + count * repl_len + 1 - count * needle_len);
+    insert_point = buffer;
+    temp = haystack;
+
+    while (true)
+    {
+        char    *p = (usecase ? strstr(temp, needle) : stristr(temp, needle));
+
+        if (!p)
+        {
+            memcpy(insert_point, temp, strlen(temp) + 1);
+            break;
+        }
+
+        memcpy(insert_point, temp, p - temp);
+        insert_point += p - temp;
+
+        memcpy(insert_point, replacement, repl_len);
+        insert_point += repl_len;
+
+        temp = p + needle_len;
+    }
+
+    memcpy(haystack, buffer, strlen(buffer) + 1);
+    free(buffer);
+}
+
+// Safe version of strdup() that checks the string was successfully allocated.
+char *M_StringDuplicate(const char *orig)
+{
+    char    *result = strdup(orig);
+
+    if (!result)
+        I_Error("Failed to duplicate string.");
+
+    return result;
+}
+
+// Returns true if str1 and str2 are the same.
+// (Case-insensitive, return value reverse of strcasecmp() to avoid confusion.
+bool M_StringCompare(const char *str1, const char *str2)
+{
+    return (str2 && !strcasecmp(str1, str2));
+}
+
+// Returns true if string begins with the specified prefix.
+bool M_StringStartsWith(const char *s, const char *prefix)
+{
+    const size_t    len = strlen(prefix);
+
+    return (strlen(s) >= len && !strncasecmp(s, prefix, len));
+}
+
+// Returns true if string ends with the specified suffix.
+bool M_StringEndsWith(const char *s, const char *suffix)
+{
+    const size_t    len1 = strlen(s);
+    const size_t    len2 = strlen(suffix);
+
+    return (len1 >= len2 && M_StringCompare(s + len1 - len2, suffix));
+}
+
+// Safe, portable vsnprintf().
+void M_vsnprintf(char *buf, int buf_len, const char *s, va_list args)
+{
+    if (buf_len >= 1)
+    {
+        // Windows (and other OSes?) have a vsnprintf() that doesn't always
+        // append a trailing \0. So we must do it, and write into a buffer
+        // that is one byte shorter; otherwise this function is unsafe.
+        int result = vsnprintf(buf, buf_len, s, args);
+
+        // If truncated, change the final char in the buffer to a \0.
+        // A negative result indicates a truncated buffer on Windows.
+        if (result < 0 || result >= buf_len)
+            buf[buf_len - 1] = '\0';
+    }
+}
+
+// Safe, portable snprintf().
+void M_snprintf(char *buf, int buf_len, const char *s, ...)
+{
+    va_list args;
+
+    va_start(args, s);
+    M_vsnprintf(buf, buf_len, s, args);
+    va_end(args);
+}
+
+#if !defined(strndup)
+char *strndup(const char *s, size_t n)
+{
+    const size_t    len = strnlen(s, n);
+    char            *new = malloc(len + 1);
+
+    if (!new)
+        return NULL;
+
+    new[len] = '\0';
+    return (char *)memcpy(new, s, len);
+}
+#endif
+
+char *M_SubString(const char *str, size_t begin, size_t len)
+{
+    const size_t    length = strlen(str);
+
+    if (!length || length < begin || length < begin + len)
+        return 0;
+
+    return strndup(str + begin, len);
+}
+
+char *uppercase(const char *str)
+{
+    char    *newstr;
+    char    *p = newstr = M_StringDuplicate(str);
+
+    while ((*p = (char)toupper((unsigned char)*p)))
+        p++;
+
+    return newstr;
+}
+
+char *lowercase(char *str)
+{
+    for (char *p = str; *p; p++)
+        *p = (char)tolower((unsigned char)*p);
+
+    return str;
+}
+
+void capitalizeword(char *source, const char *substring)
+{
+    const size_t    len = strlen(substring);
+
+    if (!len)
+        return;
+
+    for (char *p = source; (p = (char *)M_StrCaseStr(p, substring)); p += len)
+        if ((p == source || !isalnum((unsigned char)p[-1]))
+            && (!p[len] || !isalnum((unsigned char)p[len])))
+            for (size_t i = 0; i < len; i++)
+                p[i] = (char)toupper((unsigned char)p[i]);
+}
+
+char *titlecase(const char *str)
+{
+    char        *newstr = M_StringDuplicate(str);
+    const int   len = (int)strlen(newstr);
+
+    if (len > 0)
+    {
+        newstr[0] = (char)toupper((unsigned char)newstr[0]);
+
+        if (len > 1)
+            for (int i = 1; i < len; i++)
+                if ((newstr[i - 1] != '\'' || (i >= 2 && newstr[i - 2] == ' '))
+                    && !isalnum((unsigned char)newstr[i - 1])
+                    && isalnum((unsigned char)newstr[i]))
+                    newstr[i] = (char)toupper((unsigned char)newstr[i]);
+    }
+
+    return newstr;
+}
+
+char *sentencecase(const char *str)
+{
+    char    *newstr = M_StringDuplicate(str);
+
+    if (newstr[0] != '\0')
+        newstr[0] = (char)toupper((unsigned char)newstr[0]);
+
+    return newstr;
+}
+
+bool isuppercase(const char *str)
+{
+    const int   len = (int)strlen(str);
+
+    for (int i = 0; i < len; i++)
+        if (islower((unsigned char)str[i]))
+            return false;
+
+    return true;
+}
+
+bool islowercase(const char *str)
+{
+    const int   len = (int)strlen(str);
+
+    for (int i = 0; i < len; i++)
+        if (isupper((unsigned char)str[i]))
+            return false;
+
+    return true;
+}
+
+char *commify(int64_t value)
+{
+    char    result[64];
+
+    M_snprintf(result, sizeof(result), "%" PRIi64, value);
+
+    if (value <= -1000 || value >= 1000)
+    {
+        char    *pt;
+        size_t  n;
+
+        for (pt = result; *pt && *pt != '.'; pt++);
+
+        n = result + sizeof(result) - pt;
+
+        while (true)
+            if ((pt -= 3) > result)
+            {
+                memmove(pt + 1, pt, n);
+                *pt = ',';
+                n += 4;
+            }
+            else
+                break;
+    }
+
+    return M_StringDuplicate(result);
+}
+
+char *commifystring(const char *str)
+{
+    size_t  len = strlen(str);
+
+    if (len)
+    {
+        bool        negative = (str[0] == '-');
+        size_t      start = (negative ? 1 : 0);
+        const char  *dot = strchr(str + start, '.');
+        size_t      intlen = (dot ? (size_t)(dot - (str + start)) : len - start);
+        size_t      commas = (intlen > 3 ? (intlen - 1) / 3 : 0);
+        size_t      outlen = len + commas + 1;
+        char        *out = (char *)I_Malloc(outlen);
+        size_t      i = intlen;
+        size_t      j = intlen + commas;
+
+        out[j] = '\0';
+
+        while (i > 0)
+        {
+            out[--j] = str[start + --i];
+
+            if (i > 0 && !((intlen - i) % 3))
+                out[--j] = ',';
+        }
+
+        if (negative)
+            out[0] = '-';
+
+        if (dot)
+            M_StringCopy(out + strlen(out), dot, outlen - strlen(out));
+
+        return out;
+    }
+
+    return M_StringDuplicate("");
+}
+
+char *commifystat(uint64_t value)
+{
+    char    result[64];
+
+    M_snprintf(result, sizeof(result), "%" PRIu64, value);
+
+    if (value >= 1000)
+    {
+        char    *pt;
+        size_t  n;
+
+        for (pt = result; *pt && *pt != '.'; pt++);
+
+        n = result + sizeof(result) - pt;
+
+        while (true)
+            if ((pt -= 3) > result)
+            {
+                memmove(pt + 1, pt, n);
+                *pt = ',';
+                n += 4;
+            }
+            else
+                break;
+    }
+
+    return M_StringDuplicate(result);
+}
+
+char *uncommify(const char *input)
+{
+    char    *p = I_Malloc(strlen(input) + 1);
+
+    char    *p2 = p;
+
+    while (*input != '\0')
+        if (*input != ',' || *(input + 1) == '\0')
+            *p2++ = *input++;
+        else
+            input++;
+
+    *p2 = '\0';
+
+    return p;
+}
+
+bool wildcard(const char *input, const char *pattern)
+{
+    if (!*pattern || M_StringCompare(input, pattern))
+        return true;
+
+    while (*pattern)
+    {
+        if (*pattern == '?')
+        {
+            if (!*input)
+                return false;
+
+            input++;
+            pattern++;
+        }
+        else if (*pattern == '*')
+        {
+            pattern++;
+
+            do
+            {
+                if (wildcard(input, pattern))
+                    return true;
+            } while (*input++);
+
+            return false;
+        }
+        else if (tolower((unsigned char)*pattern++) != tolower((unsigned char)*input++))
+            return false;
+    }
+
+    return (*input == '\0');
+}
+
+int gcd(int a, int b)
+{
+    return (!b ? a : gcd(b, a % b));
+}
+
+int numspaces(const char *str)
+{
+    int         result = 0;
+    const int   len = (int)strlen(str);
+
+    for (int i = 0; i < len; i++)
+        result += (str[i] == ' ');
+
+    return result;
+}
+
+char *removespaces(const char *input)
+{
+    char    *p = I_Malloc(strlen(input) + 1);
+
+    char    *p2 = p;
+
+    while (*input != '\0')
+        if (!isspace((unsigned char)*input))
+            *p2++ = *input++;
+        else
+            input++;
+
+    *p2 = '\0';
+
+    return p;
+}
+
+char *removenonalpha(const char *input)
+{
+    char    *p = I_Malloc(strlen(input) + 1);
+
+    char    *p2 = p;
+
+    while (*input != '\0')
+        if (isalnum((unsigned char)*input))
+            *p2++ = *input++;
+        else
+            input++;
+
+    *p2 = '\0';
+
+    return p;
+}
+
+char *trimnonalpha(const char *input)
+{
+    const char  *start = input;
+    const char  *end = input + strlen(input);
+    char        *trimmed;
+    size_t      len;
+
+    while (*start && !isalpha((unsigned char)*start))
+        start++;
+
+    while (end > start && !isalpha((unsigned char)*(end - 1)))
+        end--;
+
+    len = (size_t)(end - start);
+    trimmed = I_Malloc(len + 1);
+
+    memcpy(trimmed, start, len);
+    trimmed[len] = '\0';
+
+    return trimmed;
+}
+
+char *removenonprintable(const char *input)
+{
+    char    *p = I_Malloc(strlen(input) + 1);
+
+    char    *p2 = p;
+
+    while (*input != '\0')
+        if (isprint((unsigned char)*input))
+            *p2++ = *input++;
+        else
+            input++;
+
+    *p2 = '\0';
+
+    return p;
+}
+
+char *trimwhitespace(char *input)
+{
+    char    *end;
+
+    while (isspace((unsigned char)*input))
+        input++;
+
+    if (!*input)
+        return input;
+
+    end = input + strlen(input) - 1;
+
+    while (end > input && isspace((unsigned char)*end))
+        end--;
+
+    *(end + 1) = '\0';
+
+    return input;
+}
+
+char *makevalidfilename(const char *input)
+{
+    char        *newstr = M_StringDuplicate(input);
+    const int   len = (int)strlen(newstr);
+
+    for (int i = 0; i < len; i++)
+        if (strchr("\\/:?\"<>|", newstr[i]))
+            newstr[i] = ' ';
+
+    return newstr;
+}
+
+char *leafname(char *path)
+{
+    char    cc;
+    char    *ptr = path;
+
+    do
+    {
+        cc = *ptr++;
+
+        if (cc == '\\' || cc == '/')
+            path = ptr;
+    } while (cc);
+
+    return path;
+}
+
+char *removeext(const char *file)
+{
+    char    *newstr = M_StringDuplicate(file);
+    char    *lastdot = strrchr(newstr, '.');
+    char    *lastforwardslash = strrchr(newstr, '/');
+    char    *lastbackslash = strrchr(newstr, '\\');
+    char    *lastseparator = (lastforwardslash > lastbackslash ? lastforwardslash : lastbackslash);
+
+    if (lastdot && (!lastseparator || lastdot > lastseparator + 1))
+        *lastdot = '\0';
+
+    return newstr;
+}
+
+bool isvowel(const char ch)
+{
+    return !!strchr("aeiouAEIOU", ch);
+}
+
+bool ispunctuation(const char ch)
+{
+    return !!strchr(".!?", ch);
+}
+
+bool isbreak(const char ch)
+{
+    return !!strchr(" /\\-", ch);
+}
+
+char *striptrailingzero(double value, int precision)
+{
+    char    *result = malloc(100);
+
+    if (result)
+    {
+        int len;
+
+        M_snprintf(result, 100, "%.*f",
+            (precision == 2 ? 2 : (value != floor(value))), value);
+        len = (int)strlen(result);
+
+        if (len >= 4 && result[len - 3] == '.' && result[len - 1] == '0')
+            result[len - 1] = '\0';
+    }
+
+    return result;
+}
+
+void M_StripQuotes(char *str)
+{
+    int len = (int)strlen(str);
+
+    if (len >= 2
+        && (((str[0] == '"' || str[0] == '\x93')
+            && (str[len - 1] == '"' || str[len - 1] == '\x94'))
+            || ((str[0] == '\'' || str[0] == '\x91')
+                && (str[len - 1] == '\'' || str[len - 1] == '\x92'))))
+    {
+        len -= 2;
+        memmove(str, str + 1, len);
+        str[len] = '\0';
+    }
+}
+
+static size_t M_PathRootLength(const char *path)
+{
+#if defined(_WIN32)
+    if (path[0] && isalpha((unsigned char)path[0]) && path[1] == ':')
+        return (2 + (path[2] == DIR_SEPARATOR));
+
+    if (path[0] == DIR_SEPARATOR && path[1] == DIR_SEPARATOR)
+        return 2;
+#endif
+
+    return (path[0] == DIR_SEPARATOR);
+}
+
+void M_NormalizeSlashes(char *str)
+{
+    char    *p;
+    char    *q = str;
+    size_t  rootlength;
+    bool    wasslash = false;
+
+    // Convert all slashes/backslashes to DIR_SEPARATOR
+    for (p = str; *p; p++)
+        if ((*p == '/' || *p == '\\') && *p != DIR_SEPARATOR)
+            *p = DIR_SEPARATOR;
+
+    rootlength = M_PathRootLength(str);
+    p = str;
+
+    // Collapse multiple slashes
+    for (size_t i = 0; i < rootlength && *p; i++)
+        *q++ = *p++;
+
+    wasslash = (q > str && q[-1] == DIR_SEPARATOR);
+
+    while (*p)
+    {
+        if (*p == DIR_SEPARATOR)
+        {
+            if (!wasslash)
+            {
+                *q++ = *p;
+                wasslash = true;
+            }
+        }
+        else
+        {
+            *q++ = *p;
+            wasslash = false;
+        }
+
+        p++;
+    }
+
+    // Remove trailing slashes without stripping the root path.
+    while (q > str + rootlength && q[-1] == DIR_SEPARATOR)
+        q--;
+
+    *q = '\0';
+}
+
+const char *pronoun(const pronoun_t type)
+{
+    if (type == personal)
+        return (playergender == playergender_male ? "he" :
+            (playergender == playergender_female ? "she" : "they"));
+    else if (type == possessive)
+        return (playergender == playergender_male ? "his" :
+            (playergender == playergender_female ? "her" : "their"));
+    else
+        return (playergender == playergender_male ? "himself" :
+            (playergender == playergender_female ? "herself" : "themselves"));
+}
+
+bool isdefaultplayername(void)
+{
+    return (M_StringCompare(playername, playername_default) || M_StringCompare(playername, "you"));
+}
+
+const char *words[][2] =
+{
+    { "agoniz",     "agonis"     }, { "airplane",   "aeroplane"  },
+    { "analog",     "analogue"   }, { "armor",      "armour"     },
+    { "artifact",   "artefact"   }, { "barreled",   "barrelled"  },
+    { "behavior",   "behaviour"  }, { "caliber",    "calibre"    },
+    { "centered",   "centred"    }, { "centering",  "centring"   },
+    { "center",     "centre"     }, { "color",      "colour"     },
+    { "defense",    "defence"    }, { "dialog",     "dialogue"   },
+    { "disk",       "disc"       }, { "discord",    "diskord"    },
+    { "donut",      "doughnut"   }, { "endeavor",   "endeavour"  },
+    { "favor",      "favour"     }, { "fiber",      "fibre"      },
+    { "flavor",     "flavour"    }, { "gray",       "grey"       },
+    { "harbor",     "harbour"    }, { "honor",      "honour"     },
+    { "humor",      "humour"     }, { "initializ",  "initialis"  },
+    { "inquir",     "enquir"     }, { "jewelry",    "jewellery"  },
+    { "judgment",   "judgement"  }, { "labor",      "labour"     },
+    { "license",    "licence"    }, { "liter",      "litre"      },
+    { "meter",      "metre"      }, { "neighbor",   "neighbour"  },
+    { "offense",    "offence"    }, { "organiz",    "organis"    },
+    { "practice",   "practise"   }, { "program",    "programme"  },
+    { "realiz",     "realis"     }, { "randomiz",   "randomis"   },
+    { "recogniz",   "recognis"   }, { "refueling",  "refuelling" },
+    { "rumor",      "rumour"     }, { "savior",     "saviour"    },
+    { "savor",      "savour"     }, { "skeptic",    "sceptic"    },
+    { "specializ",  "specialis"  }, { "stabiliz",   "stabilis"   },
+    { "standardiz", "standardis" }, { "synchroniz", "synchronis" },
+    { "theater",    "theatre"    }, { "traveled",   "travelled"  },
+    { "traveling",  "travelling" }, { "utiliz",     "utilis"     },
+    { "vapor",      "vapour"     }, { "whiskey",    "whisky"     },
+    { "yogurt",     "yoghurt"    }, { "",           ""           }
+};
+
+static void M_Translate(char *string, const char *word1, const char *word2)
+{
+    char    *temp1 = M_StringDuplicate(word1);
+    char    *temp2 = M_StringDuplicate(word2);
+
+    M_StringReplaceAll(string, temp1, temp2, true);
+
+    temp1[0] = (char)toupper((unsigned char)temp1[0]);
+    temp2[0] = (char)toupper((unsigned char)temp2[0]);
+
+    M_StringReplaceAll(string, temp1, temp2, true);
+
+    free(temp1);
+    free(temp2);
+
+    temp1 = uppercase(word1);
+    temp2 = uppercase(word2);
+
+    M_StringReplaceAll(string, temp1, temp2, true);
+
+    free(temp1);
+    free(temp2);
+}
+
+void M_AmericanToBritishEnglish(char *string)
+{
+    for (int i = 0; *words[i][0]; i++)
+        M_Translate(string, words[i][0], words[i][1]);
+}
+
+void M_BritishToAmericanEnglish(char *string)
+{
+    for (int i = 0; *words[i][0]; i++)
+        M_Translate(string, words[i][1], words[i][0]);
+}
+
+void M_TranslateAutocomplete(void)
+{
+    if (english == english_american)
+        for (int i = 0; *autocompletelist[i].text; i++)
+            M_BritishToAmericanEnglish(autocompletelist[i].text);
+    else
+        for (int i = 0; *autocompletelist[i].text; i++)
+            M_AmericanToBritishEnglish(autocompletelist[i].text);
+}
+
+const char *dayofweek(int day, int month, int year)
+{
+    const int   adjustment = (14 - month) / 12;
+
+    month += 12 * adjustment - 2;
+    year -= adjustment;
+
+    return daynames[(day + (13 * month - 1) / 5 + year + year / 4 - year / 100 + year / 400) % 7];
+}

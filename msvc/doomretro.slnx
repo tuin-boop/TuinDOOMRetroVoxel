@@ -1,0 +1,8 @@
+<Solution>
+  <Configurations>
+    <Platform Name="64-bit" />
+  </Configurations>
+  <Project Path="doomretro.vcxproj" Id="8b744a3b-8f18-41a0-85a3-293816e85b6e">
+    <Platform Project="x64" />
+  </Project>
+</Solution>

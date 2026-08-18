@@ -1,0 +1,314 @@
+#
+#============================================================================
+#
+#                                 DOOM Retro
+#           The classic, refined DOOM source port. For Windows PC.
+#
+#============================================================================
+#
+#    Copyright © 1993-2026 by id Software LLC, a ZeniMax Media company.
+#    Copyright © 2013-2026 by Brad Harding <mailto:brad@doomretro.com>.
+#
+#    This file is a part of DOOM Retro.
+#
+#    DOOM Retro is free software: you can redistribute it and/or modify it
+#    under the terms of the GNU General Public License as published by the
+#    Free Software Foundation, either version 3 of the license, or (at your
+#    option) any later version.
+#
+#    DOOM Retro is distributed in the hope that it will be useful, but
+#    WITHOUT ANY WARRANTY; without even the implied warranty of
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
+#    General Public License for more details.
+#
+#    You should have received a copy of the GNU General Public License
+#    along with DOOM Retro. If not, see <https://www.gnu.org/licenses/>.
+#
+#    DOOM is a registered trademark of id Software LLC, a ZeniMax Media
+#    company, in the US and/or other countries, and is used without
+#    permission. All other trademarks are the property of their respective
+#    holders. DOOM Retro is in no way affiliated with nor endorsed by
+#    id Software.
+#
+#============================================================================
+#
+
+name: Tuin DOOM Retro Voxel
+
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows:
+    runs-on: windows-2025-vs2026
+
+    strategy:
+      matrix:
+        platform: [64-bit]
+        configuration: [Release]
+        include:
+          - platform: 64-bit
+            project-platform: x64
+            output-dir: Release
+            artifact-suffix: win64
+
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Cache NuGet packages
+        uses: actions/cache@v6
+        with:
+          path: ~/.nuget/packages
+          key: ${{ runner.os }}-nuget-${{ hashFiles('**/packages.config') }}
+          restore-keys: |
+            ${{ runner.os }}-nuget-
+
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@v3
+
+      - name: Restore NuGet packages
+        run: nuget restore msvc\doomretro.sln
+
+      - name: Extract version
+        id: version
+        run: |
+          $versionLine = Get-Content src\version.h | Select-String -Pattern '#define DOOMRETRO_VERSIONSTRING\s+"([^"]+)"'
+          $version = $versionLine.Matches.Groups[1].Value
+          echo "VERSION=$version" >> $env:GITHUB_OUTPUT
+        shell: pwsh
+
+      - name: Build
+        run: msbuild msvc\doomretro.sln /p:Configuration=${{ matrix.configuration }} /p:Platform=${{ matrix.platform }} /p:PlatformToolset=v143 /m
+
+      - name: Copy artifacts to bin directory
+        run: |
+          $sourcePath = "msvc\${{ matrix.output-dir }}"
+          $destPath = "bin\${{ matrix.project-platform }}\${{ matrix.configuration }}"
+          
+          New-Item -ItemType Directory -Force -Path $destPath | Out-Null
+          
+          Copy-Item "$sourcePath\*.exe" -Destination $destPath
+          Copy-Item "$sourcePath\*.dll" -Destination $destPath -ErrorAction SilentlyContinue
+          Copy-Item "res\doomretro.wad" -Destination $destPath
+        shell: pwsh
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: doomretro-v${{ steps.version.outputs.VERSION }}-${{ matrix.artifact-suffix }}
+          path: |
+            bin/${{ matrix.project-platform }}/${{ matrix.configuration }}/*.exe
+            bin/${{ matrix.project-platform }}/${{ matrix.configuration }}/*.dll
+            bin/${{ matrix.project-platform }}/${{ matrix.configuration }}/*.wad
+
+  build-linux:
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        compiler: [gcc, clang]
+
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Cache dependencies
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cache/ccache
+            build
+          key: ${{ runner.os }}-${{ matrix.compiler }}-${{ hashFiles('**/CMakeLists.txt', 'src/**') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.compiler }}-
+
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y cmake libsdl2-dev libsdl2-mixer-dev libsdl2-image-dev ccache wget file
+
+      - name: Extract version
+        id: version
+        run: |
+          version=$(awk -F'"' '/#define DOOMRETRO_VERSIONSTRING/ { print $2; exit }' src/version.h)
+          echo "VERSION=$version" >> $GITHUB_OUTPUT
+
+      - name: Configure
+        run: |
+          mkdir -p build
+          cd build
+          cmake -DCMAKE_INSTALL_PREFIX=/usr \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_C_COMPILER=${{ matrix.compiler }} \
+                -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+                ..
+
+      - name: Build
+        run: |
+          cd build
+          make -j$(nproc) VERBOSE=1
+
+      - name: Create AppImage
+        if: matrix.compiler == 'gcc'
+        run: |
+          wget -q https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
+          chmod +x linuxdeploy-x86_64.AppImage
+
+          mkdir -p AppDir/usr/bin
+          mkdir -p AppDir/usr/share/applications
+          mkdir -p AppDir/usr/share/icons/hicolor/256x256/apps
+
+          cp build/doomretro AppDir/usr/bin/
+          cp build/doomretro.wad AppDir/usr/bin/ || cp res/doomretro.wad AppDir/usr/bin/
+          cp res/doomretro.desktop AppDir/usr/share/applications/
+          cp res/doomretro.iconset/icon_256x256.png AppDir/usr/share/icons/hicolor/256x256/apps/doomretro.png
+
+          ./linuxdeploy-x86_64.AppImage --appdir AppDir --output appimage
+
+          mv DOOM_Retro*.AppImage doomretro-v${{ steps.version.outputs.VERSION }}-x86_64.AppImage
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: doomretro-linux-${{ matrix.compiler }}
+          path: |
+            build/doomretro
+            build/doomretro.wad
+
+      - name: Upload AppImage
+        if: matrix.compiler == 'gcc'
+        uses: actions/upload-artifact@v7
+        with:
+          name: doomretro-v${{ steps.version.outputs.VERSION }}-x86_64-AppImage
+          path: doomretro-v${{ steps.version.outputs.VERSION }}-x86_64.AppImage
+
+  clang-tidy:
+    runs-on: ubuntu-latest
+
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Cache dependencies
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/ccache
+          key: ${{ runner.os }}-clang-tidy-${{ hashFiles('**/CMakeLists.txt', 'src/**') }}
+          restore-keys: |
+            ${{ runner.os }}-clang-tidy-
+
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y cmake clang-tidy libsdl2-dev libsdl2-mixer-dev libsdl2-image-dev ccache
+
+      - name: Configure
+        run: |
+          cmake -S . -B build-tidy \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_C_COMPILER=clang \
+                -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+                -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+
+      - name: Run clang-tidy
+        run: |
+          python3 - <<'PY'
+          import json
+          import subprocess
+          from pathlib import Path
+
+          repo_root = Path.cwd().resolve()
+          excluded_dirs = (
+              repo_root / 'src' / 'cJSON',
+              repo_root / 'src' / 'miniz',
+          )
+
+          def is_vendored(path: Path) -> bool:
+              return any(excluded_dir in path.parents for excluded_dir in excluded_dirs)
+
+          with open('build-tidy/compile_commands.json', encoding='utf-8') as f:
+              commands = json.load(f)
+
+          files = sorted({
+              str(path)
+              for entry in commands
+              for path in [Path(entry['file']).resolve()]
+              if path.suffix == '.c' and not is_vendored(path)
+          })
+
+          if not files:
+              raise SystemExit('No C source files found in compile_commands.json')
+
+          subprocess.run(['clang-tidy', '-p', 'build-tidy', *files], check=True)
+          PY
+
+  build-macos:
+    runs-on: macos-latest
+
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Cache dependencies
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/Library/Caches/ccache
+          key: ${{ runner.os }}-${{ hashFiles('**/CMakeLists.txt', 'src/**') }}
+          restore-keys: |
+            ${{ runner.os }}-
+
+      - name: Install dependencies
+        run: |
+          brew install cmake sdl2 sdl2_mixer ccache
+
+      - name: Extract version
+        id: version
+        run: |
+          version=$(awk -F'"' '/#define DOOMRETRO_VERSIONSTRING/ { print $2; exit }' src/version.h)
+          echo "VERSION=$version" >> $GITHUB_OUTPUT
+
+      - name: Configure
+        run: |
+          rm -rf build
+          mkdir -p build
+          cd build
+          cmake -DCMAKE_INSTALL_PREFIX=/usr/local \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+                ..
+
+      - name: Build
+        run: |
+          cd build
+          make -j$(sysctl -n hw.ncpu) VERBOSE=1
+
+      - name: Install app bundle
+        run: |
+          rm -rf dist
+          cmake --install build --prefix "$PWD/dist"
+
+      - name: Ad-hoc sign app bundle
+        run: |
+          codesign --force --deep --sign - dist/doomretro.app
+
+      - name: Archive app bundle
+        run: |
+          ditto -c -k --sequesterRsrc --keepParent dist/doomretro.app doomretro-v${{ steps.version.outputs.VERSION }}-macos.zip
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: doomretro-v${{ steps.version.outputs.VERSION }}-macos
+          path: doomretro-v${{ steps.version.outputs.VERSION }}-macos.zip
